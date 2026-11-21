@@ -27,10 +27,12 @@ impl MotifState {
             return Self::Listening;
         }
         match state {
-            AgentState::Idle | AgentState::Completed { .. } => Self::Idle,
+            AgentState::Idle | AgentState::Paused | AgentState::NeedsUserInput { .. } | AgentState::Completed { .. } => Self::Idle,
             AgentState::Listening => Self::Listening,
             AgentState::Processing { .. } | AgentState::Streaming { .. } => Self::Thinking,
-            AgentState::Acting { .. } | AgentState::WaitingForConfirmation { .. } => Self::Acting,
+            AgentState::Acting { .. }
+            | AgentState::ComputerUsePreview { .. }
+            | AgentState::WaitingForConfirmation { .. } => Self::Acting,
             AgentState::Error { .. } => Self::Idle,
         }
     }

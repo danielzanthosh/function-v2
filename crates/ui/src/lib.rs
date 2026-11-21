@@ -5,6 +5,7 @@
 #![recursion_limit = "4096"]
 
 pub mod actions;
+mod computer_preview;
 pub mod components;
 pub mod conversation;
 pub mod local_commands;

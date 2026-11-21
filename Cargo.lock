@@ -1592,6 +1592,7 @@ name = "function-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "function-config",
  "function-memory",
  "function-providers",
@@ -1648,10 +1649,12 @@ name = "function-platform"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "cpal",
  "function-config",
  "hound",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -1679,7 +1682,9 @@ name = "function-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "function-config",
+ "function-memory",
  "function-platform",
  "serde",
  "serde_json",

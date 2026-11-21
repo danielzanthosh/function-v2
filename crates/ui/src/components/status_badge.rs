@@ -18,6 +18,13 @@ pub fn render_status_badge(state: &AgentState, theme: &Theme) -> impl IntoElemen
         AgentState::Acting { action_description } => {
             (theme.status_acting, action_description.clone())
         }
+        AgentState::Paused => (theme.status_idle, "Paused".to_string()),
+        AgentState::NeedsUserInput { .. } => {
+            (theme.status_processing, "Attention Required".to_string())
+        }
+        AgentState::ComputerUsePreview { target_title, .. } => {
+            (theme.status_acting, format!("Controlling {}", target_title))
+        }
         AgentState::WaitingForConfirmation { .. } => {
             (theme.status_processing, "Confirmation Required".to_string())
         }

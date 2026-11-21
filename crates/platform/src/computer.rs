@@ -23,22 +23,28 @@ pub struct ScreenDimensions {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetWindow {
+    pub id: u32,
+    pub process_id: i32,
+    pub title: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
 
-/// Keeps the visual activity indicator visible during a complete input operation.
-struct ActivityGlowGuard;
-
-impl ActivityGlowGuard {
-    fn new() -> Self {
-        crate::set_macos_activity_glow(true);
-        Self
+impl TargetWindow {
+    pub fn map_pixel_to_screen(&self, x: i32, y: i32, image_width: u32, image_height: u32) -> (i32, i32) {
+        if image_width == 0 || image_height == 0 {
+            return (self.x.round() as i32, self.y.round() as i32);
+        }
+        let x = (x as f64 * self.width / image_width as f64).clamp(0.0, self.width.max(1.0) - 1.0);
+        let y = (y as f64 * self.height / image_height as f64).clamp(0.0, self.height.max(1.0) - 1.0);
+        ((self.x + x).round() as i32, (self.y + y).round() as i32)
     }
 }
 
-impl Drop for ActivityGlowGuard {
-    fn drop(&mut self) {
-        crate::set_macos_activity_glow(false);
-    }
-}
 
 // Dimensions of the most recent screenshot, in image pixels. Model-provided mouse
 // coordinates refer to this image space, while macOS CoreGraphics expects logical points.
@@ -52,6 +58,24 @@ pub fn remember_screenshot_size(width: u32, height: u32) {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_capture_helper() -> std::path::PathBuf {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(contents) = executable.parent().and_then(|path| path.parent()) {
+            if let Some(bundled) = bundled_macos_capture_helper(contents) {
+                return bundled;
+            }
+        }
+    }
+    std::path::PathBuf::from(env!("FUNCTION_MACOS_CAPTURE_HELPER"))
+}
+
+fn bundled_macos_capture_helper(contents: &std::path::Path) -> Option<std::path::PathBuf> {
+    let main_executable = contents.join("MacOS/function-app");
+    let helper = contents.join("Helpers/function-macos-capture");
+    (main_executable.is_file() && helper.is_file()).then_some(helper)
+}
+
 /// Convert coordinates from the last screenshot's pixel space into the platform's
 /// native input coordinate space. On macOS this maps Retina pixels to logical points.
 pub fn map_screenshot_coordinates(x: i32, y: i32, screen: ScreenDimensions) -> (i32, i32) {
@@ -63,6 +87,13 @@ pub fn map_screenshot_coordinates(x: i32, y: i32, screen: ScreenDimensions) -> (
     let mapped_y = (y as f64 * screen.height as f64 / image_size.1 as f64).round() as i32;
     (mapped_x.clamp(0, screen.width.saturating_sub(1) as i32),
      mapped_y.clamp(0, screen.height.saturating_sub(1) as i32))
+}
+
+fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 24 || &data[..8] != b"\x89PNG\r\n\x1a\n" { return None; }
+    let width = u32::from_be_bytes(data[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(data[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 pub trait ComputerControl: Send + Sync {
@@ -83,7 +114,6 @@ pub trait ComputerControl: Send + Sync {
     /// Move through short interpolated steps so automation looks deliberate
     /// and gives the target application time to process pointer events.
     fn mouse_move_smooth(&self, x: i32, y: i32) -> Result<(), PlatformError> {
-        let _glow = ActivityGlowGuard::new();
         let (x, y) = map_screenshot_coordinates(x, y, self.get_screen_dimensions());
         let (start_x, start_y) = self.get_cursor_position();
         let steps = smooth_motion_steps(start_x, start_y, x, y);
@@ -101,7 +131,6 @@ pub trait ComputerControl: Send + Sync {
     /// Type with a small inter-character cadence instead of injecting the
     /// entire string in one burst.
     fn keyboard_type_smooth(&self, text: &str) -> Result<(), PlatformError> {
-        let _glow = ActivityGlowGuard::new();
         let character_count = text.chars().count();
         for (index, character) in text.chars().enumerate() {
             self.keyboard_type(&character.to_string())?;
@@ -117,6 +146,45 @@ pub trait ComputerControl: Send + Sync {
     fn list_windows(&self) -> Vec<WindowInfo>;
     fn focus_window(&self, title_substring: &str) -> Result<bool, PlatformError>;
     fn take_screenshot(&self) -> Result<Vec<u8>, PlatformError>;
+    fn list_target_windows(&self) -> Result<Vec<TargetWindow>, PlatformError> {
+        Err(PlatformError::Unsupported("Target window capture is unavailable".into()))
+    }
+    fn start_window_stream(&self, _window_id: u32) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Target window streaming is unavailable".into()))
+    }
+    fn target_window_frame(&self, _window_id: u32) -> Result<Vec<u8>, PlatformError> {
+        Err(PlatformError::Unsupported("Target window capture is unavailable".into()))
+    }
+    fn target_accessibility_snapshot(&self, _window_id: u32) -> Result<serde_json::Value, PlatformError> {
+        Err(PlatformError::Unsupported("Target accessibility inspection is unavailable".into()))
+    }
+    fn target_accessibility_action(&self, _window_id: u32, _ref_id: &str, _operation: &str, _value: Option<&str>) -> Result<serde_json::Value, PlatformError> {
+        Err(PlatformError::Unsupported("Target accessibility actions are unavailable".into()))
+    }
+    fn target_mouse_click(&self, _window: &TargetWindow, _x: i32, _y: i32, _button: MouseButton) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted input is unavailable".into()))
+    }
+    fn target_mouse_double_click(&self, _window: &TargetWindow, _x: i32, _y: i32) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted double-click is unavailable".into()))
+    }
+    fn target_mouse_move(&self, _window: &TargetWindow, _x: i32, _y: i32) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted input is unavailable".into()))
+    }
+    fn target_mouse_scroll(&self, _window: &TargetWindow, _x: i32, _y: i32, _delta: i32) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted scrolling is unavailable".into()))
+    }
+    fn target_mouse_drag(&self, _window: &TargetWindow, _start_x: i32, _start_y: i32, _end_x: i32, _end_y: i32) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted dragging is unavailable".into()))
+    }
+    fn target_keyboard_type(&self, _window: &TargetWindow, _text: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted input is unavailable".into()))
+    }
+    fn target_keyboard_press(&self, _window: &TargetWindow, _key: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted input is unavailable".into()))
+    }
+    fn target_keyboard_shortcut(&self, _window: &TargetWindow, _keys: &[&str]) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Targeted keyboard shortcuts are unavailable".into()))
+    }
 }
 
 pub fn smooth_motion_steps(start_x: i32, start_y: i32, end_x: i32, end_y: i32) -> u32 {
@@ -126,7 +194,14 @@ pub fn smooth_motion_steps(start_x: i32, start_y: i32, end_x: i32, end_y: i32) -
 
 #[cfg(test)]
 mod motion_tests {
-    use super::{map_screenshot_coordinates, remember_screenshot_size, smooth_motion_steps, ScreenDimensions};
+    use super::{bundled_macos_capture_helper, map_screenshot_coordinates, remember_screenshot_size, smooth_motion_steps, ScreenDimensions, TargetWindow};
+
+    #[test]
+    fn target_coordinates_map_to_the_window_without_using_cursor_state() {
+        let window = TargetWindow { id: 4, process_id: 8, title: "Target".into(), x: 300.0, y: 120.0, width: 800.0, height: 600.0 };
+        assert_eq!(window.map_pixel_to_screen(400, 300, 1600, 1200), (500, 270));
+        assert_eq!(window.map_pixel_to_screen(-10, 2000, 1600, 1200), (300, 719));
+    }
 
     #[test]
     fn motion_uses_more_steps_for_longer_paths() {
@@ -142,6 +217,22 @@ mod motion_tests {
         assert_eq!(map_screenshot_coordinates(1710, 1107, screen), (855, 554));
         assert_eq!(map_screenshot_coordinates(0, 0, screen), (0, 0));
         assert_eq!(map_screenshot_coordinates(4000, 3000, screen), (1709, 1106));
+    }
+
+    #[test]
+    fn incomplete_app_bundle_does_not_select_its_nested_helper() {
+        let root = std::env::temp_dir().join(format!("function-helper-path-{}", std::process::id()));
+        let contents = root.join("Contents");
+        let helper = contents.join("Helpers/function-macos-capture");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(&helper, b"helper").unwrap();
+
+        assert_eq!(bundled_macos_capture_helper(&contents), None);
+
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::write(contents.join("MacOS/function-app"), b"main").unwrap();
+        assert_eq!(bundled_macos_capture_helper(&contents), Some(helper));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -263,8 +354,7 @@ pub mod windows {
         }
 
         fn mouse_click(&self, button: MouseButton) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            unsafe {
+                unsafe {
                 match button {
                     MouseButton::Left => {
                         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
@@ -284,15 +374,13 @@ pub mod windows {
         }
 
         fn mouse_double_click(&self, button: MouseButton) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            self.mouse_click(button)?;
+                self.mouse_click(button)?;
             std::thread::sleep(std::time::Duration::from_millis(60));
             self.mouse_click(button)
         }
 
         fn mouse_scroll(&self, delta: i32) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            unsafe {
+                unsafe {
                 let wheel_delta = (delta * 120) as u32;
                 mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0);
                 Ok(())
@@ -306,8 +394,7 @@ pub mod windows {
             end_x: i32,
             end_y: i32,
         ) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            let screen = self.get_screen_dimensions();
+                let screen = self.get_screen_dimensions();
             let (start_x, start_y) = map_screenshot_coordinates(start_x, start_y, screen);
             let (end_x, end_y) = map_screenshot_coordinates(end_x, end_y, screen);
             self.mouse_move(start_x, start_y)?;
@@ -334,8 +421,7 @@ pub mod windows {
         }
 
         fn keyboard_press(&self, key: &str) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            if let Some(vk) = Self::key_name_to_vk(key) {
+                if let Some(vk) = Self::key_name_to_vk(key) {
                 unsafe {
                     keybd_event(vk, 0, 0, 0);
                     keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
@@ -347,8 +433,7 @@ pub mod windows {
         }
 
         fn keyboard_shortcut(&self, keys: &[&str]) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            let vks: Vec<u8> = keys
+                let vks: Vec<u8> = keys
                 .iter()
                 .filter_map(|k| Self::key_name_to_vk(k))
                 .collect();
@@ -601,8 +686,7 @@ pub mod macos {
         }
 
         fn mouse_click(&self, button: MouseButton) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            // CGEventPost requires macOS Post Event permission. Accessibility being
+                // CGEventPost requires macOS Post Event permission. Accessibility being
             // enabled in the UI is not enough to assume synthetic events are accepted.
             unsafe {
                 if !CGPreflightPostEventAccess() {
@@ -664,8 +748,7 @@ pub mod macos {
         }
 
         fn mouse_double_click(&self, button: MouseButton) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            self.mouse_click(button)?;
+                self.mouse_click(button)?;
             std::thread::sleep(std::time::Duration::from_millis(60));
             let (x, y) = self.get_cursor_position();
             let pt = CGPoint {
@@ -697,8 +780,7 @@ pub mod macos {
         }
 
         fn mouse_scroll(&self, delta: i32) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            unsafe {
+                unsafe {
                 let ev = CGEventCreateScrollWheelEvent(std::ptr::null(), 1, 1, delta);
                 if !ev.is_null() {
                     CGEventPost(K_CG_HID_EVENT_TAP, ev);
@@ -715,8 +797,7 @@ pub mod macos {
             end_x: i32,
             end_y: i32,
         ) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            let screen = self.get_screen_dimensions();
+                let screen = self.get_screen_dimensions();
             let (start_x, start_y) = map_screenshot_coordinates(start_x, start_y, screen);
             let (end_x, end_y) = map_screenshot_coordinates(end_x, end_y, screen);
             self.mouse_move(start_x, start_y)?;
@@ -786,8 +867,7 @@ pub mod macos {
         }
 
         fn keyboard_press(&self, key: &str) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            let keycode = match key.to_lowercase().as_str() {
+                let keycode = match key.to_lowercase().as_str() {
                 "return" | "enter" => 36,
                 "tab" => 48,
                 "space" => 49,
@@ -857,8 +937,7 @@ pub mod macos {
         }
 
         fn keyboard_shortcut(&self, keys: &[&str]) -> Result<(), PlatformError> {
-            let _glow = ActivityGlowGuard::new();
-            let mut flags: u64 = 0;
+                let mut flags: u64 = 0;
             let mut main_key = "";
 
             for &k in keys {
@@ -1010,6 +1089,97 @@ pub mod macos {
                 remember_screenshot_size(width, height);
             }
             Ok(bytes)
+        }
+
+        fn list_target_windows(&self) -> Result<Vec<TargetWindow>, PlatformError> {
+            let result = crate::macos_helper::call("listWindows", serde_json::json!({}))?;
+            serde_json::from_value(result).map_err(|error| PlatformError::SystemApi(format!("Invalid window list from native helper: {error}")))
+        }
+
+        fn start_window_stream(&self, window_id: u32) -> Result<(), PlatformError> {
+            crate::macos_helper::call("startStream", serde_json::json!({"windowId": window_id}))?;
+            Ok(())
+        }
+
+        fn target_window_frame(&self, window_id: u32) -> Result<Vec<u8>, PlatformError> {
+            let result = crate::macos_helper::call("captureWindow", serde_json::json!({"windowId": window_id}))?;
+            use base64::Engine;
+            let encoded = result.get("pngBase64").and_then(serde_json::Value::as_str).ok_or_else(|| PlatformError::SystemApi("Native helper response did not contain a window frame".into()))?;
+            base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|error| PlatformError::SystemApi(format!("Invalid frame encoding: {error}")))
+        }
+
+        fn target_accessibility_snapshot(&self, window_id: u32) -> Result<serde_json::Value, PlatformError> {
+            crate::macos_helper::call("accessibilitySnapshot", serde_json::json!({"windowId": window_id}))
+        }
+
+        fn target_accessibility_action(&self, window_id: u32, ref_id: &str, operation: &str, value: Option<&str>) -> Result<serde_json::Value, PlatformError> {
+            crate::macos_helper::call("accessibilityAction", serde_json::json!({"windowId": window_id, "ref": ref_id, "operation": operation, "value": value}))
+        }
+
+        fn target_mouse_click(&self, window: &TargetWindow, x: i32, y: i32, button: MouseButton) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            let (image_width, image_height) = self.target_window_frame(window.id).ok().and_then(|bytes| png_dimensions(&bytes)).unwrap_or((window.width.ceil() as u32, window.height.ceil() as u32));
+            let (x, y) = window.map_pixel_to_screen(x, y, image_width, image_height);
+            crate::macos_helper::call("click", serde_json::json!({"windowId": window.id, "x": x, "y": y, "button": format!("{button:?}").to_lowercase(), "clickCount": 1}))?;
+            Ok(())
+        }
+
+        fn target_mouse_double_click(&self, window: &TargetWindow, x: i32, y: i32) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            let (image_width, image_height) = self.target_window_frame(window.id).ok().and_then(|bytes| png_dimensions(&bytes)).unwrap_or((window.width.ceil() as u32, window.height.ceil() as u32));
+            let (x, y) = window.map_pixel_to_screen(x, y, image_width, image_height);
+            crate::macos_helper::call("click", serde_json::json!({"windowId": window.id, "x": x, "y": y, "button": "left", "clickCount": 2}))?;
+            Ok(())
+        }
+
+        fn target_mouse_move(&self, window: &TargetWindow, x: i32, y: i32) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            let (image_width, image_height) = self.target_window_frame(window.id).ok().and_then(|bytes| png_dimensions(&bytes)).unwrap_or((window.width.ceil() as u32, window.height.ceil() as u32));
+            let (x, y) = window.map_pixel_to_screen(x, y, image_width, image_height);
+            crate::macos_helper::call("movePointer", serde_json::json!({"windowId": window.id, "x": x, "y": y}))?;
+            Ok(())
+        }
+
+        fn target_mouse_scroll(&self, window: &TargetWindow, x: i32, y: i32, delta: i32) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            let (image_width, image_height) = self.target_window_frame(window.id).ok().and_then(|bytes| png_dimensions(&bytes)).unwrap_or((window.width.ceil() as u32, window.height.ceil() as u32));
+            let (x, y) = window.map_pixel_to_screen(x, y, image_width, image_height);
+            crate::macos_helper::call("scroll", serde_json::json!({"windowId": window.id, "x": x, "y": y, "delta": delta}))?;
+            Ok(())
+        }
+
+        fn target_mouse_drag(&self, window: &TargetWindow, start_x: i32, start_y: i32, end_x: i32, end_y: i32) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            let (image_width, image_height) = self.target_window_frame(window.id).ok().and_then(|bytes| png_dimensions(&bytes)).unwrap_or((window.width.ceil() as u32, window.height.ceil() as u32));
+            let start = window.map_pixel_to_screen(start_x, start_y, image_width, image_height);
+            let end = window.map_pixel_to_screen(end_x, end_y, image_width, image_height);
+            crate::macos_helper::call("drag", serde_json::json!({"windowId": window.id, "startX": start.0, "startY": start.1, "endX": end.0, "endY": end.1}))?;
+            Ok(())
+        }
+
+        fn target_keyboard_type(&self, window: &TargetWindow, text: &str) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            crate::macos_helper::call("typeText", serde_json::json!({"windowId": window.id, "text": text}))?;
+            Ok(())
+        }
+
+        fn target_keyboard_press(&self, window: &TargetWindow, key: &str) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            crate::macos_helper::call("pressKey", serde_json::json!({"windowId": window.id, "key": key}))?;
+            Ok(())
+        }
+
+        fn target_keyboard_shortcut(&self, window: &TargetWindow, keys: &[&str]) -> Result<(), PlatformError> {
+            let window = self.find_target_window(window.id)?;
+            crate::macos_helper::call("pressShortcut", serde_json::json!({"windowId": window.id, "keys": keys}))?;
+            Ok(())
+        }
+    }
+
+    impl MacOsComputerControl {
+        fn find_target_window(&self, window_id: u32) -> Result<TargetWindow, PlatformError> {
+            self.list_target_windows()?.into_iter().find(|window| window.id == window_id)
+                .ok_or_else(|| PlatformError::SystemApi("Target window closed or changed; select it again".into()))
         }
     }
 }

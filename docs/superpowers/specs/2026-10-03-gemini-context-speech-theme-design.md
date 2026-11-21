@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Extend Function V1 with reliable context-window management, Gemini support through Google's OpenAI-compatible API, independent STT/TTS provider configuration, and a more professional emoji-free settings experience.
+Extend Function V2 with reliable context-window management, Gemini support through Google's OpenAI-compatible API, independent STT/TTS provider configuration, and a more professional emoji-free settings experience.
 
 ## Requirements
 

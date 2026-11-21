@@ -13,6 +13,7 @@ use crate::actions::{
     CancelTask, ClearInput, CloseFunction, SubmitRequest, ToggleExpanded, ToggleSpotlight,
     ToggleTheme, ToggleVoice,
 };
+use crate::computer_preview::{preview_cursor_position, preview_geometry};
 use crate::components::function_motif::{render_function_motif, MotifState};
 use crate::components::launcher_icons::{
     app_icon, calculator_icon, file_icon, folder_icon, network_icon, settings_icon, terminal_icon,
@@ -37,9 +38,10 @@ use function_platform::{
 use function_providers::ChatMessage;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgba, AsyncApp, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    div, img, px, rgba, AsyncApp, Context, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, Render, Rgba, ScrollHandle, Size, Task, Timer, WeakEntity, Window,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Checks if a key string represents a named control key rather than text to type.
@@ -89,6 +91,74 @@ fn is_named_control_key(k: &str) -> bool {
     )
 }
 
+fn render_computer_preview(preview: ComputerPreview, theme: &Theme) -> impl IntoElement {
+    let dimensions = if preview.frame.len() >= 24 && &preview.frame[..8] == b"\x89PNG\r\n\x1a\n" {
+        (
+            u32::from_be_bytes(preview.frame[16..20].try_into().unwrap_or([0; 4])),
+            u32::from_be_bytes(preview.frame[20..24].try_into().unwrap_or([0; 4])),
+        )
+    } else { (0, 0) };
+    const MAX_WIDTH: f32 = 460.0;
+    const MAX_HEIGHT: f32 = 300.0;
+    let geometry = preview_geometry(dimensions.0, dimensions.1, MAX_WIDTH, MAX_HEIGHT);
+    let image_width = geometry.map_or(MAX_WIDTH, |size| size.width);
+    let image_height = geometry.map_or(220.0, |size| size.height);
+    let cursor = geometry.and_then(|size| {
+        preview.cursor_x.zip(preview.cursor_y).and_then(|(x, y)| {
+            preview_cursor_position(x, y, dimensions.0, dimensions.1, size.scale)
+        })
+    });
+    let image = Arc::new(Image::from_bytes(ImageFormat::Png, preview.frame));
+    const AI_CURSOR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 32"><path d="M2 1.5v25l6.5-6.5 4.2 9.5 4.5-2-4.3-9.6 9-.3L2 1.5z" fill="#fafafa" stroke="#171717" stroke-width="2" stroke-linejoin="round"/><path d="M3.5 4.5 18 17l-6.5.2 4.1 9.2-1.9.9-4.2-9.4-4.8 4.8V4.5z" fill="#fafafa"/></svg>"##;
+    let cursor_image = Arc::new(Image::from_bytes(ImageFormat::Svg, AI_CURSOR.as_bytes().to_vec()));
+    div()
+        .id("computer_use_preview")
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_xs()
+                .text_color(theme.text_secondary)
+                .child("Computer use · AI cursor stays with the target app")
+                .child(div().text_color(theme.text_muted).child(format!("{} · window {}", preview.title, preview.window_id))),
+        )
+        .child(
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(MAX_WIDTH))
+                .h(px(image_height))
+                .overflow_hidden()
+                .rounded_md()
+                .bg(theme.surface_input)
+                .child(
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .w(px(image_width))
+                        .h(px(image_height))
+                        .child(img(image).w(px(image_width)).h(px(image_height)))
+                        .when_some(cursor, |view, (x, y)| {
+                            view.child(
+                                img(cursor_image)
+                                    .absolute()
+                                    .left(px(x - 1.0))
+                                    .top(px(y - 1.0))
+                                    .w(px(24.0))
+                                    .h(px(32.0)),
+                            )
+                        }),
+                ),
+        )
+}
+
 /// Maps a character to its shifted counterpart on standard keyboards.
 fn shift_char(c: char) -> char {
     match c {
@@ -133,6 +203,24 @@ pub enum FunctionMode {
     Expanded,
 }
 
+#[derive(Clone)]
+pub struct ComputerPreview {
+    pub window_id: u32,
+    pub title: String,
+    pub frame: Vec<u8>,
+    pub cursor_x: Option<i32>,
+    pub cursor_y: Option<i32>,
+}
+
+#[derive(Clone)]
+struct PendingUserChoice {
+    question: String,
+    options: Vec<String>,
+    history: Vec<ChatMessage>,
+    tool_call_id: Option<String>,
+    selected_window_id: Option<u32>,
+}
+
 // Aliases for backwards compatibility
 pub type AssistantMode = FunctionMode;
 
@@ -147,6 +235,8 @@ pub struct FunctionView {
     pub active_task: Option<String>,
     pub state: AgentState,
     pub activities: Vec<ActivityEntry>,
+    pub computer_preview: Option<ComputerPreview>,
+    pending_user_choice: Option<PendingUserChoice>,
     pub latest_result: Option<String>,
     pub listening: bool,
     pub audio_capture: Option<std::sync::Arc<dyn function_platform::AudioCapture>>,
@@ -216,6 +306,32 @@ fn status_bar_snippet(text: &str) -> String {
         .collect()
 }
 
+fn spawn_agent_turn(
+    agent: std::sync::Arc<function_agent::Agent>,
+    prompt: String,
+    history: Vec<ChatMessage>,
+    selected_window_id: Option<u32>,
+) {
+    let task = async move {
+        let _ = agent.execute_with_history_in_window(&prompt, history, selected_window_id).await;
+    };
+    if let Some(handle) = crate::get_runtime_handle() {
+        handle.spawn(task);
+    } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(task);
+    } else {
+        std::thread::spawn(move || {
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                runtime.block_on(task);
+            }
+        });
+    }
+}
+
+
 impl FunctionView {
     pub fn new(cx: &mut Context<Self>, mic_configured: bool, mic_available: bool) -> Self {
         let focus_handle = cx.focus_handle();
@@ -271,6 +387,8 @@ impl FunctionView {
             active_task: None,
             state: AgentState::Idle,
             activities: Vec::new(),
+            computer_preview: None,
+            pending_user_choice: None,
             latest_result: None,
             listening: false,
             audio_capture: None,
@@ -462,7 +580,6 @@ impl FunctionView {
                             match &state_clone {
                                 AgentState::Processing { thought_summary } => {
                                     view.state = state_clone.clone();
-                                    function_platform::set_macos_task_running(true);
                                     // Prefer a short, model-provided progress summary over a generic label.
                                     let status = thought_summary
                                         .as_deref()
@@ -485,7 +602,6 @@ impl FunctionView {
                                 }
                                 AgentState::Acting { action_description } => {
                                     view.state = state_clone.clone();
-                                    function_platform::set_macos_task_running(true);
                                     let status = status_bar_snippet(action_description);
                                     function_platform::set_macos_status_text(if status.is_empty() { "Taking action" } else { &status });
                                     for activity in &mut view.activities {
@@ -499,12 +615,27 @@ impl FunctionView {
                                         status: ActivityStatus::Running,
                                     });
                                 }
+                                AgentState::Paused => {
+                                    view.state = AgentState::Paused;
+                                }
+                                AgentState::ComputerUsePreview { target_window_id, target_title, frame, cursor_x, cursor_y } => {
+                                    view.state = state_clone.clone();
+                                    let previous_cursor = view.computer_preview.as_ref()
+                                        .filter(|preview| preview.window_id == *target_window_id)
+                                        .and_then(|preview| preview.cursor_x.zip(preview.cursor_y));
+                                    view.computer_preview = Some(ComputerPreview {
+                                        window_id: *target_window_id,
+                                        title: target_title.clone(),
+                                        frame: frame.clone(),
+                                        cursor_x: (*cursor_x).or(previous_cursor.map(|cursor| cursor.0)),
+                                        cursor_y: (*cursor_y).or(previous_cursor.map(|cursor| cursor.1)),
+                                    });
+                                }
                                 AgentState::Streaming {
                                     chunk: _,
                                     accumulated,
                                 } => {
                                     view.state = state_clone.clone();
-                                    function_platform::set_macos_task_running(true);
                                     // Mirror only the first four words of the live model output in
                                     // the menu bar. Never leave streamed text visible after completion.
                                     let status = status_bar_snippet(accumulated);
@@ -537,25 +668,44 @@ impl FunctionView {
                                     summary,
                                     new_history,
                                 } => {
-                                    function_platform::set_macos_task_running(false);
+                                    let clarification =
+                                        function_agent::parse_clarification_options(summary);
+                                    let display_summary = clarification
+                                        .as_ref()
+                                        .map(|choice| choice.display_text.clone())
+                                        .unwrap_or_else(|| summary.clone());
                                     view.state = state_clone.clone();
-                                    // Clear immediately when the response finishes so idle never
-                                    // inherits a stale "Working…" or response snippet.
-                                    function_platform::set_macos_status_text("");
-                                    view.latest_result = Some(summary.clone());
+                                    view.pending_user_choice = clarification.as_ref().map(|choice| {
+                                        PendingUserChoice {
+                                            question: choice.question.clone(),
+                                            options: choice.options.clone(),
+                                            history: new_history.clone(),
+                                            tool_call_id: None,
+                                            selected_window_id: None,
+                                        }
+                                    });
+                                    if view.pending_user_choice.is_some() {
+                                        function_platform::set_macos_status_text("Attention Required");
+                                        if let Some(choice) = clarification.as_ref() {
+                                            function_platform::notify_macos_attention_required(&choice.question);
+                                        }
+                                    } else {
+                                        function_platform::set_macos_status_text("");
+                                    }
+                                    view.latest_result = Some(display_summary.clone());
                                     if let Some(last) = view.chat_display.last_mut() {
                                         if !last.is_user {
-                                            last.text = summary.clone();
-                                        } else if !summary.is_empty() {
+                                            last.text = display_summary.clone();
+                                        } else if !display_summary.is_empty() {
                                             view.chat_display.push(ChatEntry {
                                                 is_user: false,
-                                                text: summary.clone(),
+                                                text: display_summary.clone(),
                                             });
                                         }
-                                    } else if !summary.is_empty() {
+                                    } else if !display_summary.is_empty() {
                                         view.chat_display.push(ChatEntry {
                                             is_user: false,
-                                            text: summary.clone(),
+                                            text: display_summary.clone(),
                                         });
                                     }
                                     view.chat_history_api = new_history.clone();
@@ -566,8 +716,16 @@ impl FunctionView {
                                         "response rendering completed"
                                     );
                                     view.activities.clear();
-                                    view.play_sound_feedback(SoundEffect::Success);
-                                    if view.config.tts.enabled && !summary.is_empty() {
+                                    if view.pending_user_choice.is_some() {
+                                        view.play_sound_feedback(SoundEffect::Error);
+                                        function_platform::trigger_macos_haptic(false);
+                                    } else {
+                                        view.play_sound_feedback(SoundEffect::Success);
+                                    }
+                                    if view.pending_user_choice.is_none()
+                                        && view.config.tts.enabled
+                                        && !summary.is_empty()
+                                    {
                                         // Stop any previous native playback before starting a new
                                         // response, then give the new response its own session ID.
                                         function_platform::stop_audio_playback();
@@ -578,7 +736,8 @@ impl FunctionView {
                                         let session_guard = view.audio_session_id.clone();
                                         view.is_playing_audio = true;
 
-                                        let text_to_speak = summary.clone();
+                                        let response_text = summary.clone();
+                                        let agent_opt = view.agent.clone();
                                         let tts_opt = view.tts_provider.clone();
                                         let output_format = view.config.tts.output_format.clone();
                                         let runtime_handle = crate::get_runtime_handle();
@@ -586,63 +745,56 @@ impl FunctionView {
                                         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                                             let cx = cx.clone();
                                             async move {
-                                                if let Some(tts) = tts_opt {
-                                                    // GPUI's executor is not necessarily inside a Tokio runtime.
-                                                    // Run the TTS provider future on Function's shared Tokio runtime
-                                                    // because the OpenAI-compatible provider uses spawn_blocking.
-                                                    let synth_res = if let Some(handle) = runtime_handle {
-                                                        match handle
-                                                            .spawn(async move {
-                                                                tts.synthesize_speech(&text_to_speak).await
-                                                            })
-                                                            .await
-                                                        {
-                                                            Ok(result) => result,
-                                                            Err(error) => {
-                                                                Err(function_providers::ProviderError::Network(
-                                                                    format!("TTS task failed: {error}"),
-                                                                ))
-                                                            }
-                                                        }
-                                                    } else if let Ok(handle) =
-                                                        tokio::runtime::Handle::try_current()
-                                                    {
-                                                        match handle
-                                                            .spawn(async move {
-                                                                tts.synthesize_speech(&text_to_speak).await
-                                                            })
-                                                            .await
-                                                        {
-                                                            Ok(result) => result,
-                                                            Err(error) => {
-                                                                Err(function_providers::ProviderError::Network(
-                                                                    format!("TTS task failed: {error}"),
-                                                                ))
-                                                            }
-                                                        }
-                                                    } else {
-                                                        Err(function_providers::ProviderError::Network(
-                                                            "Tokio runtime unavailable for TTS".to_string(),
-                                                        ))
-                                                    };
-
-                                                    if session_guard.load(std::sync::atomic::Ordering::SeqCst)
-                                                        == current_audio_session
-                                                    {
-                                                        match synth_res {
-                                                            Ok(audio) => {
-                                                                let _ = function_platform::play_audio_bytes(
-                                                                    &audio,
-                                                                    &output_format,
-                                                                );
+                                                let spoken_text = match (agent_opt, runtime_handle) {
+                                                    (Some(agent), Some(handle)) => {
+                                                        match handle.spawn(async move {
+                                                            agent.generate_speech_text(&response_text).await
+                                                        }).await {
+                                                            Ok(Ok(text)) => Some(text),
+                                                            Ok(Err(error)) => {
+                                                                tracing::warn!("Could not generate speech summary: {error}");
+                                                                None
                                                             }
                                                             Err(error) => {
-                                                                tracing::error!("TTS request failed: {}", error);
+                                                                tracing::warn!("Speech summary task failed: {error}");
+                                                                None
                                                             }
                                                         }
                                                     }
-                                                } else {
-                                                    function_platform::speak_text(&text_to_speak);
+                                                    _ => {
+                                                        tracing::warn!("Speech summary unavailable: agent or Tokio runtime missing");
+                                                        None
+                                                    }
+                                                };
+
+                                                if session_guard.load(std::sync::atomic::Ordering::SeqCst)
+                                                    == current_audio_session
+                                                {
+                                                    if let Some(text) = spoken_text {
+                                                        if let Some(tts) = tts_opt {
+                                                            let synth = if let Some(handle) = crate::get_runtime_handle() {
+                                                                let tts_text = text.clone();
+                                                                handle.spawn(async move { tts.synthesize_speech(&tts_text).await }).await
+                                                                    .unwrap_or_else(|error| Err(function_providers::ProviderError::Network(format!("TTS task failed: {error}"))))
+                                                            } else {
+                                                                Err(function_providers::ProviderError::Network("Tokio runtime unavailable for TTS".into()))
+                                                            };
+                                                            match synth {
+                                                                Ok(audio) => {
+                                                                    if let Err(error) = function_platform::play_audio_bytes(&audio, &output_format) {
+                                                                        tracing::warn!("Could not play generated TTS audio: {error}; using native speech");
+                                                                        function_platform::speak_text(&text);
+                                                                    }
+                                                                }
+                                                                Err(error) => {
+                                                                    tracing::warn!("TTS request failed: {error}; using native speech");
+                                                                    function_platform::speak_text(&text);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            function_platform::speak_text(&text);
+                                                        }
+                                                    }
                                                 }
 
                                                 while function_platform::is_audio_playing() {
@@ -677,12 +829,41 @@ impl FunctionView {
                                         );
                                     }
                                 }
+                                AgentState::NeedsUserInput {
+                                    question,
+                                    options,
+                                    tool_call_id,
+                                    selected_window_id,
+                                    new_history,
+                                } => {
+                                    view.state = state_clone.clone();
+                                    view.pending_user_choice = Some(PendingUserChoice {
+                                        question: question.to_string(),
+                                        options: options.clone(),
+                                        history: new_history.clone(),
+                                        tool_call_id: Some(tool_call_id.to_string()),
+                                        selected_window_id: *selected_window_id,
+                                    });
+                                    view.chat_history_api = new_history.clone();
+                                    view.latest_result = Some(question.to_string());
+                                    view.active_task = None;
+                                    view.activities.clear();
+                                    function_platform::set_macos_status_text("Attention Required");
+                                    function_platform::notify_macos_attention_required(&question);
+                                    view.play_sound_feedback(SoundEffect::Error);
+                                    function_platform::trigger_macos_haptic(false);
+                                    view.save_current_conversation();
+                                    if !view.user_scrolled_up {
+                                        view.chat_scroll_handle.scroll_to_item(
+                                            view.chat_display.len().saturating_sub(1),
+                                        );
+                                    }
+                                }
                                 AgentState::Error {
                                     message,
                                     new_history,
                                 } => {
                                     view.state = state_clone.clone();
-                                    function_platform::set_macos_task_running(false);
                                     function_platform::set_macos_status_text("");
                                     tracing::warn!(
                                         target: "function_ui",
@@ -705,7 +886,6 @@ impl FunctionView {
                                 }
                                 AgentState::WaitingForConfirmation { action, .. } => {
                                     view.state = state_clone.clone();
-                                    function_platform::set_macos_task_running(true);
                                     view.activities.push(ActivityEntry {
                                         step: view.activities.len() + 1,
                                         description: format!(
@@ -802,7 +982,6 @@ impl FunctionView {
     }
 
     pub fn stop_response(&mut self, cx: &mut Context<Self>) {
-        function_platform::set_macos_task_running(false);
         function_platform::set_macos_status_text("");
         if let Some(ref agent) = self.agent {
             agent.cancel();
@@ -819,7 +998,7 @@ impl FunctionView {
         let phase_changed = std::mem::discriminant(&self.state) != std::mem::discriminant(&state);
         if phase_changed {
             let success = matches!(state, AgentState::Completed { .. });
-            if matches!(state, AgentState::Listening | AgentState::Processing { .. } | AgentState::Acting { .. } | AgentState::WaitingForConfirmation { .. } | AgentState::Completed { .. } | AgentState::Error { .. }) {
+            if matches!(state, AgentState::Listening | AgentState::Processing { .. } | AgentState::Acting { .. } | AgentState::ComputerUsePreview { .. } | AgentState::WaitingForConfirmation { .. } | AgentState::Completed { .. } | AgentState::Error { .. }) {
                 function_platform::trigger_macos_haptic(success);
             }
         }
@@ -866,6 +1045,8 @@ impl FunctionView {
             self.state,
             AgentState::Processing { .. }
                 | AgentState::Acting { .. }
+                | AgentState::Paused
+                | AgentState::ComputerUsePreview { .. }
                 | AgentState::WaitingForConfirmation { .. }
         ) {
             Size {
@@ -2211,10 +2392,56 @@ impl FunctionView {
         }
     }
 
+    fn select_user_choice(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_user_choice.take() else {
+            return;
+        };
+        let Some(choice) = pending.options.get(index).cloned() else {
+            self.pending_user_choice = Some(pending);
+            return;
+        };
+        let Some(agent) = self.agent.clone() else {
+            return;
+        };
+
+        self.play_sound_feedback(SoundEffect::Select);
+        let mut history = pending.history.clone();
+        if let Some(tool_call_id) = pending.tool_call_id {
+            history.push(function_agent::choice_result_message(tool_call_id, &choice));
+        }
+        self.chat_history_api = history.clone();
+        self.chat_display.push(ChatEntry {
+            is_user: true,
+            text: choice.clone(),
+        });
+        self.active_task = Some(choice.clone());
+        self.latest_result = None;
+        self.state = AgentState::Processing {
+            thought_summary: None,
+        };
+        self.activities.clear();
+        self.activities.push(ActivityEntry {
+            step: 1,
+            description: "Continuing with your choice…".into(),
+            status: ActivityStatus::Running,
+        });
+        function_platform::set_macos_status_text("Continuing…");
+        function_platform::trigger_macos_haptic(false);
+        self.mode = FunctionMode::Command;
+        window.resize(self.target_window_size());
+        self.chat_scroll_handle.scroll_to_item(self.chat_display.len().saturating_sub(1));
+        spawn_agent_turn(agent, choice, history, pending.selected_window_id);
+        cx.notify();
+    }
+
     pub fn submit(&mut self, _: &SubmitRequest, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.input_buffer.trim().to_string();
         if prompt.is_empty() {
             return;
+        }
+        let pending_choice = self.pending_user_choice.take();
+        if pending_choice.is_some() {
+            function_platform::set_macos_status_text("");
         }
 
         let is_busy = matches!(
@@ -2222,6 +2449,8 @@ impl FunctionView {
             AgentState::Processing { .. }
                 | AgentState::Streaming { .. }
                 | AgentState::Acting { .. }
+                | AgentState::Paused
+                | AgentState::ComputerUsePreview { .. }
                 | AgentState::WaitingForConfirmation { .. }
         );
         if is_busy || self.is_playing_audio {
@@ -2234,12 +2463,14 @@ impl FunctionView {
             self.state = AgentState::Idle;
         }
 
-        if let Some(command) = resolve_shell_command(&prompt) {
-            self.execute_launcher_action(LauncherAction::ExecuteShell(command), window, cx);
-            return;
+        if pending_choice.is_none() {
+            if let Some(command) = resolve_shell_command(&prompt) {
+                self.execute_launcher_action(LauncherAction::ExecuteShell(command), window, cx);
+                return;
+            }
         }
 
-        if let Some(cmd) = resolve_local_command(&prompt) {
+        if let Some(cmd) = if pending_choice.is_none() { resolve_local_command(&prompt) } else { None } {
             match cmd {
                 LocalCommand::Configure => {
                     self.input_buffer.clear();
@@ -2316,35 +2547,20 @@ impl FunctionView {
         });
 
         if let Some(agent) = self.agent.clone() {
-            function_platform::set_macos_task_running(true);
             self.state = AgentState::Processing {
                 thought_summary: None,
             };
         function_platform::trigger_macos_haptic(false);
 
-            let history_snapshot = self.chat_history_api.clone();
+            let mut history_snapshot = self.chat_history_api.clone();
+            let selected_window_id = pending_choice.as_ref().and_then(|pending| pending.selected_window_id);
+            if let Some(tool_call_id) = pending_choice.and_then(|pending| pending.tool_call_id) {
+                history_snapshot.push(function_agent::choice_result_message(tool_call_id, &prompt));
+            }
+            self.chat_history_api = history_snapshot.clone();
             let prompt_clone = prompt.clone();
 
-            let task = async move {
-                let _ = agent
-                    .execute_with_history(&prompt_clone, history_snapshot)
-                    .await;
-            };
-
-            if let Some(handle) = crate::get_runtime_handle() {
-                handle.spawn(task);
-            } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(task);
-            } else {
-                std::thread::spawn(move || {
-                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        rt.block_on(task);
-                    }
-                });
-            }
+            spawn_agent_turn(agent, prompt_clone, history_snapshot, selected_window_id);
         } else {
             self.state = AgentState::Idle;
             let no_agent_reply =
@@ -2387,7 +2603,6 @@ impl FunctionView {
                     return;
                 }
                 "escape" | "n" => {
-                    function_platform::set_macos_task_running(false);
                     self.play_sound_feedback(SoundEffect::Select);
                     self.state = AgentState::Idle;
                     self.latest_result = Some("Action denied by user. Operation canceled.".into());
@@ -3125,6 +3340,7 @@ impl Render for FunctionView {
             self.state,
             AgentState::Processing { .. }
                 | AgentState::Acting { .. }
+                | AgentState::ComputerUsePreview { .. }
                 | AgentState::WaitingForConfirmation { .. }
         );
         let has_chat = !self.chat_display.is_empty();
@@ -3220,6 +3436,8 @@ impl Render for FunctionView {
                         AgentState::Acting { action_description } => {
                             format!("→ {}", action_description)
                         }
+                        AgentState::Paused => "Paused · safe to switch apps".into(),
+                        AgentState::NeedsUserInput { .. } => "Attention Required".into(),
                         AgentState::WaitingForConfirmation { action, .. } => {
                             format!("Confirm: {}", action)
                         }
@@ -3249,6 +3467,9 @@ impl Render for FunctionView {
                         .pt(px(12.0))
                         .pb(px(8.0))
                         .gap(px(8.0))
+                        .when_some(self.computer_preview.clone(), |p, preview| {
+                            p.child(render_computer_preview(preview, &theme))
+                        })
                         .children(chat_entries.into_iter().enumerate().map(|(idx, entry)| {
                             if entry.is_user {
                                 let user_bg = if theme.is_dark() {
@@ -3390,6 +3611,59 @@ impl Render for FunctionView {
                                 }
                             }
                         }))
+                        .when_some(self.pending_user_choice.clone(), |parent, pending| {
+                            parent.child(
+                                div()
+                                    .id("attention_required_choices")
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(8.0))
+                                    .w_full()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .bg(theme.surface_elevated)
+                                    .border_1()
+                                    .border_color(theme.accent_primary)
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(theme.accent_primary)
+                                            .child("Attention Required"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.text_primary)
+                                            .child(pending.question),
+                                    )
+                                    .children(pending.options.into_iter().enumerate().map(
+                                        |(index, option)| {
+                                            div()
+                                                .id(("clarification_choice", index))
+                                                .cursor_pointer()
+                                                .w_full()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .bg(theme.surface_input)
+                                                .border_1()
+                                                .border_color(theme.border_subtle)
+                                                .hover(|style| style.bg(theme.surface_active))
+                                                .text_sm()
+                                                .text_color(theme.text_primary)
+                                                .child(option)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, window, cx| {
+                                                        this.select_user_choice(index, window, cx);
+                                                    }),
+                                                )
+                                        },
+                                    )),
+                            )
+                        })
                         .when_some(busy_state_text, |p, status| {
                             p.child(
                                 div()
@@ -3731,6 +4005,32 @@ impl Render for FunctionView {
                             .when(is_busy || self.is_playing_audio, |p| {
                                 p.child(
                                     div()
+                                        .id("computer_use_pause_control")
+                                        .cursor_pointer()
+                                        .px(px(8.0))
+                                        .py(px(5.0))
+                                        .rounded_md()
+                                        .bg(theme.surface_input)
+                                        .border_1()
+                                        .border_color(theme.border_subtle)
+                                        .hover(|s| s.bg(theme.surface_active))
+                                        .text_xs()
+                                        .text_color(theme.text_primary)
+                                        .child(if matches!(self.state, AgentState::Paused) { "Resume" } else { "Pause" })
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                            if let Some(agent) = &this.agent {
+                                                if matches!(this.state, AgentState::Paused) {
+                                                    agent.resume();
+                                                } else {
+                                                    agent.pause();
+                                                    this.state = AgentState::Paused;
+                                                    cx.notify();
+                                                }
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    div()
                                         .id("generation_stop_control")
                                         .cursor_pointer()
                                         .flex()
@@ -3758,6 +4058,8 @@ impl Render for FunctionView {
                                                     AgentState::Processing { .. }
                                                         | AgentState::Streaming { .. }
                                                         | AgentState::Acting { .. }
+                                                    | AgentState::Paused
+                                                        | AgentState::ComputerUsePreview { .. }
                                                         | AgentState::WaitingForConfirmation { .. }
                                                 ) {
                                                     this.stop_response(cx);

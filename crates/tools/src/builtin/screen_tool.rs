@@ -29,7 +29,7 @@ impl Tool for ScreenTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect screen resolution, mouse cursor coordinates, or capture a screen screenshot."
+        "Inspect screen resolution or cursor coordinates, capture the desktop, or list, observe, and inspect an individual app window without activating it."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -38,9 +38,13 @@ impl Tool for ScreenTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["dimensions", "cursor_position", "screenshot"],
-                    "description": "The screen action: 'screenshot' to capture visual screen content, 'dimensions' for screen resolution, or 'cursor_position' for coordinates."
-                }
+                    "enum": ["dimensions", "cursor_position", "screenshot", "target_windows", "target_screenshot", "target_accessibility", "target_accessibility_action"],
+                    "description": "Use target_windows to list capturable app windows. target_screenshot observes one window without bringing it to the front, including when another app covers it. target_accessibility inspects its controls; target_accessibility_action operates an observed control. Use screenshot for the full desktop."
+                },
+                "window_id": { "type": "integer", "description": "Window ID returned by target_windows" },
+                "ref": { "type": "string", "description": "Element ref returned by target_accessibility" },
+                "operation": { "type": "string", "enum": ["press", "focus", "set_value"] },
+                "value": { "type": "string", "description": "Value to set on an accessibility text field" }
             },
             "required": ["action"]
         })
@@ -57,6 +61,48 @@ impl Tool for ScreenTool {
             .unwrap_or("screenshot");
 
         match action {
+            "target_accessibility" => {
+                let window_id = required_window_id(&params, self.name())?;
+                let mut snapshot = self.control.target_accessibility_snapshot(window_id).map_err(|e| ToolError::ExecutionFailed { tool: self.name().into(), details: e.to_string() })?;
+                if let Some(object) = snapshot.as_object_mut() {
+                    let title = self.control.list_target_windows().ok()
+                        .and_then(|windows| windows.into_iter().find(|window| window.id == window_id).map(|window| window.title));
+                    object.insert("title".into(), json!(title));
+                }
+                Ok(ToolResult::success(format!("Read accessible controls in window {window_id}"), snapshot))
+            }
+            "target_accessibility_action" => {
+                let window_id = required_window_id(&params, self.name())?;
+                let ref_id = params.get("ref").and_then(|value| value.as_str()).ok_or_else(|| ToolError::InvalidParameters { tool: self.name().into(), details: "ref must come from a recent target_accessibility snapshot".into() })?;
+                let operation = params.get("operation").and_then(|value| value.as_str()).ok_or_else(|| ToolError::InvalidParameters { tool: self.name().into(), details: "operation is required".into() })?;
+                let value = params.get("value").and_then(|value| value.as_str());
+                let output = self.control.target_accessibility_action(window_id, ref_id, operation, value).map_err(|e| ToolError::ExecutionFailed { tool: self.name().into(), details: e.to_string() })?;
+                Ok(ToolResult::success(format!("Applied accessibility action '{operation}'"), output))
+            }
+            "target_windows" => {
+                let windows = self.control.list_target_windows().map_err(|e| ToolError::ExecutionFailed {
+                    tool: self.name().into(), details: e.to_string(),
+                })?;
+                let output = serde_json::to_value(&windows).unwrap_or_else(|_| json!([]));
+                Ok(ToolResult::success(format!("Found {} capturable application windows", windows.len()), json!({ "windows": output })))
+            }
+            "target_screenshot" => {
+                let window_id = params.get("window_id").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).ok_or_else(|| ToolError::InvalidParameters {
+                    tool: self.name().into(), details: "window_id must be a valid ID from target_windows".into(),
+                })?;
+                let window = self.control.list_target_windows().map_err(|e| ToolError::ExecutionFailed { tool: self.name().into(), details: e.to_string() })?
+                    .into_iter().find(|window| window.id == window_id).ok_or_else(|| ToolError::ExecutionFailed {
+                        tool: self.name().into(), details: "Target window closed or changed; list target windows again".into(),
+                    })?;
+                let frame = self.control.target_window_frame(window_id).map_err(|e| ToolError::ExecutionFailed {
+                    tool: self.name().into(), details: e.to_string(),
+                })?;
+                let (width, height) = png_dimensions(&frame).unwrap_or((0, 0));
+                Ok(ToolResult::success(
+                    format!("Captured target window {window_id} ({width}x{height})"),
+                    json!({ "window_id": window_id, "title": window.title, "width": width, "height": height, "base64": to_base64(&frame) }),
+                ))
+            }
             "screenshot" => {
                 let dims = self.control.get_screen_dimensions();
                 match self.control.take_screenshot() {
@@ -116,6 +162,12 @@ impl Tool for ScreenTool {
             }),
         }
     }
+}
+
+fn required_window_id(params: &serde_json::Value, tool: &str) -> Result<u32, ToolError> {
+    params.get("window_id").and_then(|value| value.as_u64()).and_then(|value| u32::try_from(value).ok()).ok_or_else(|| ToolError::InvalidParameters {
+        tool: tool.into(), details: "window_id must be a valid ID returned by target_windows".into(),
+    })
 }
 
 fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {

@@ -5,6 +5,8 @@
 
 pub mod audio;
 pub mod computer;
+#[cfg(target_os = "macos")]
+mod macos_helper;
 pub mod search;
 pub use audio::*;
 pub use computer::*;
@@ -285,6 +287,7 @@ pub fn ensure_single_instance() -> bool {
 static AUDIO_PROCESSES: std::sync::Mutex<
     Vec<std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>>,
 > = std::sync::Mutex::new(Vec::new());
+static NEXT_AUDIO_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Stop any active audio playback processes immediately.
 pub fn stop_audio_playback() {
@@ -316,6 +319,36 @@ pub fn is_audio_playing() -> bool {
     }
 }
 
+fn track_audio_process(child: std::process::Child, cleanup_file: Option<std::path::PathBuf>) {
+    let handle = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    if let Ok(mut lock) = AUDIO_PROCESSES.lock() {
+        lock.push(std::sync::Arc::clone(&handle));
+    }
+    std::thread::spawn(move || loop {
+        let finished = if let Ok(mut guard) = handle.lock() {
+            match guard.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => {
+                        guard.take();
+                        true
+                    }
+                    Ok(None) => false,
+                },
+                None => true,
+            }
+        } else {
+            true
+        };
+        if finished {
+            if let Some(path) = &cleanup_file {
+                let _ = std::fs::remove_file(path);
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    });
+}
+
 /// Speak text using the operating system's native speech facilities (TTS fallback).
 pub fn speak_text(text: &str) {
     let clean_text = text.replace(['"', '\\', '\n', '\r'], " ");
@@ -327,26 +360,7 @@ pub fn speak_text(text: &str) {
     #[cfg(target_os = "macos")]
     {
         if let Ok(child) = std::process::Command::new("say").arg(&text_owned).spawn() {
-            let handle = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-            if let Ok(mut lock) = AUDIO_PROCESSES.lock() {
-                lock.push(std::sync::Arc::clone(&handle));
-            }
-            std::thread::spawn(move || loop {
-                let finished = if let Ok(mut guard) = handle.lock() {
-                    match guard.as_mut() {
-                        Some(child) => match child.try_wait() {
-                            Ok(Some(_)) => { guard.take(); true }
-                            Ok(None) => false,
-                            Err(_) => { guard.take(); true }
-                        },
-                        None => true,
-                    }
-                } else {
-                    true
-                };
-                if finished { break; }
-                std::thread::sleep(std::time::Duration::from_millis(40));
-            });
+            track_audio_process(child, None);
         }
     }
 
@@ -360,26 +374,7 @@ pub fn speak_text(text: &str) {
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .spawn()
         {
-            let handle = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-            if let Ok(mut lock) = AUDIO_PROCESSES.lock() {
-                lock.push(std::sync::Arc::clone(&handle));
-            }
-            std::thread::spawn(move || loop {
-                let finished = if let Ok(mut guard) = handle.lock() {
-                    match guard.as_mut() {
-                        Some(child) => match child.try_wait() {
-                            Ok(Some(_)) => { guard.take(); true }
-                            Ok(None) => false,
-                            Err(_) => { guard.take(); true }
-                        },
-                        None => true,
-                    }
-                } else {
-                    true
-                };
-                if finished { break; }
-                std::thread::sleep(std::time::Duration::from_millis(40));
-            });
+            track_audio_process(child, None);
         }
     }
 
@@ -401,8 +396,9 @@ pub fn play_audio_bytes(bytes: &[u8], extension: &str) -> Result<(), PlatformErr
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect::<String>();
     let path = std::env::temp_dir().join(format!(
-        "function-tts-{}.{}",
+        "function-tts-{}-{}.{}",
         std::process::id(),
+        NEXT_AUDIO_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         if safe_extension.is_empty() {
             "wav"
         } else {
@@ -434,23 +430,7 @@ pub fn play_audio_bytes(bytes: &[u8], extension: &str) -> Result<(), PlatformErr
 
     match command.spawn() {
         Ok(child) => {
-            let handle = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-            if let Ok(mut lock) = AUDIO_PROCESSES.lock() {
-                lock.push(std::sync::Arc::clone(&handle));
-            }
-            std::thread::spawn(move || {
-                let child_opt = {
-                    if let Ok(mut guard) = handle.lock() {
-                        guard.take()
-                    } else {
-                        None
-                    }
-                };
-                if let Some(mut child) = child_opt {
-                    let _ = child.wait();
-                }
-                let _ = std::fs::remove_file(path);
-            });
+            track_audio_process(child, Some(path));
             Ok(())
         }
         Err(error) => {
@@ -2246,124 +2226,51 @@ pub fn set_macos_status_text(status: &str) {
     let _ = status;
 }
 
-/// Show a non-interactive macOS screen-edge glow while computer actions are running.
-/// The hide is debounced so consecutive tool calls keep the glow continuously visible.
-static G_ACTIVITY_GLOW_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-static G_ACTIVITY_GLOW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static G_ACTIVITY_TASK_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Keep the edge glow active for the full agent task, including model thinking and tool waits.
-pub fn set_macos_task_running(active: bool) {
-    G_ACTIVITY_TASK_RUNNING.store(active, std::sync::atomic::Ordering::SeqCst);
-    set_macos_activity_glow(active);
-}
-
-
-pub fn set_macos_activity_glow(active: bool) {
+/// Show a native macOS alert for an agent decision. The in-app choice card remains the fallback.
+pub fn notify_macos_attention_required(question: &str) {
     #[cfg(target_os = "macos")]
     unsafe {
-        #[repr(C)]
-        #[derive(Copy, Clone)]
-        struct CGPoint { x: f64, y: f64 }
-        #[repr(C)]
-        #[derive(Copy, Clone)]
-        struct CGSize { width: f64, height: f64 }
-        #[repr(C)]
-        #[derive(Copy, Clone)]
-        struct CGRect { origin: CGPoint, size: CGSize }
-
+        use std::ffi::{c_void, CString};
+        type Send0 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type Send1 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
         extern "C" {
-            fn objc_getClass(name: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
-            fn sel_registerName(name: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+            fn objc_getClass(name: *const std::os::raw::c_char) -> *mut c_void;
+            fn sel_registerName(name: *const std::os::raw::c_char) -> *mut c_void;
             fn objc_msgSend();
-            fn dispatch_async_f(queue: *mut std::ffi::c_void, context: *mut std::ffi::c_void, work: unsafe extern "C" fn(*mut std::ffi::c_void));
-            fn dispatch_after_f(when: u64, queue: *mut std::ffi::c_void, context: *mut std::ffi::c_void, work: unsafe extern "C" fn(*mut std::ffi::c_void));
-            fn dispatch_time(when: u64, delta: i64) -> u64;
-            static _dispatch_main_q: std::ffi::c_void;
-            fn CGMainDisplayID() -> u32;
-            fn CGDisplayBounds(display: u32) -> CGRect;
         }
+        let send0: Send0 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send1: Send1 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let selector = |name: &'static std::ffi::CStr| sel_registerName(name.as_ptr());
 
-        struct GlowUpdate { active: bool, generation: u64 }
-        unsafe extern "C" fn apply_glow(ctx: *mut std::ffi::c_void) {
-            let update = Box::from_raw(ctx as *mut GlowUpdate);
-            if !update.active && (G_ACTIVITY_TASK_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
-                || G_ACTIVITY_GLOW_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != update.generation) {
-                return;
-            }
-            type Send0 = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-            type Send1 = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-            type SendBool = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, bool) -> *mut std::ffi::c_void;
-            type SendInt = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, isize) -> *mut std::ffi::c_void;
-            type SendFloat = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, f64) -> *mut std::ffi::c_void;
-            type SendFloat32 = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, f32) -> *mut std::ffi::c_void;
-            type SendRect = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, CGRect, usize, usize, bool) -> *mut std::ffi::c_void;
-            type SendColor = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, f64, f64, f64, f64) -> *mut std::ffi::c_void;
-            let send0: Send0 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send1: Send1 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_bool: SendBool = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_int: SendInt = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_float: SendFloat = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_float32: SendFloat32 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_rect: SendRect = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_color: SendColor = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-
-            let window_ptr = G_ACTIVITY_GLOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) as *mut std::ffi::c_void;
-            if update.active {
-                let window = if window_ptr.is_null() {
-                    let bounds = CGDisplayBounds(CGMainDisplayID());
-                    let frame = CGRect { origin: bounds.origin, size: bounds.size };
-                    let cls = objc_getClass(c"NSWindow".as_ptr());
-                    let alloc = send0(cls, sel_registerName(c"alloc".as_ptr()));
-                    let init: *mut std::ffi::c_void = send_rect(alloc, sel_registerName(c"initWithContentRect:styleMask:backing:defer:".as_ptr()), frame, 0, 2, false);
-                    if init.is_null() { return; }
-                    let window = init;
-                    let ns_color = objc_getClass(c"NSColor".as_ptr());
-                    let clear = send0(ns_color, sel_registerName(c"clearColor".as_ptr()));
-                    send1(window, sel_registerName(c"setBackgroundColor:".as_ptr()), clear);
-                    send_bool(window, sel_registerName(c"setOpaque:".as_ptr()), false);
-                    send_bool(window, sel_registerName(c"setHasShadow:".as_ptr()), false);
-                    send_bool(window, sel_registerName(c"setIgnoresMouseEvents:".as_ptr()), true);
-                    send_int(window, sel_registerName(c"setLevel:".as_ptr()), 1000);
-                    send_int(window, sel_registerName(c"setCollectionBehavior:".as_ptr()), (1 | 16 | 64) as isize);
-                    let content = send0(window, sel_registerName(c"contentView".as_ptr()));
-                    send_bool(content, sel_registerName(c"setWantsLayer:".as_ptr()), true);
-                    let layer = send0(content, sel_registerName(c"layer".as_ptr()));
-                    send_float(layer, sel_registerName(c"setBorderWidth:".as_ptr()), 4.0);
-                    send_float(layer, sel_registerName(c"setShadowRadius:".as_ptr()), 18.0);
-                    send_float32(layer, sel_registerName(c"setShadowOpacity:".as_ptr()), 0.95_f32);
-                    send_float(layer, sel_registerName(c"setCornerRadius:".as_ptr()), 0.0);
-                    let blue = send_color(ns_color, sel_registerName(c"colorWithCalibratedRed:green:blue:alpha:".as_ptr()), 0.25, 0.58, 1.0, 0.95);
-                    let cg_color = send0(blue, sel_registerName(c"CGColor".as_ptr()));
-                    send1(layer, sel_registerName(c"setBorderColor:".as_ptr()), cg_color);
-                    send1(layer, sel_registerName(c"setShadowColor:".as_ptr()), cg_color);
-
-                    G_ACTIVITY_GLOW_WINDOW.store(window as isize, std::sync::atomic::Ordering::SeqCst);
-                    window
-                } else { window_ptr };
-                let order = sel_registerName(c"orderFrontRegardless".as_ptr());
-                send0(window, order);
-            } else if !window_ptr.is_null() {
-                send1(window_ptr, sel_registerName(c"orderOut:".as_ptr()), std::ptr::null_mut());
-            }
+        let notification_class = objc_getClass(c"NSUserNotification".as_ptr());
+        let center_class = objc_getClass(c"NSUserNotificationCenter".as_ptr());
+        let string_class = objc_getClass(c"NSString".as_ptr());
+        if notification_class.is_null() || center_class.is_null() || string_class.is_null() {
+            tracing::warn!("AppKit notification classes are unavailable");
+            return;
         }
-
-        let generation = if active {
-            G_ACTIVITY_GLOW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-        } else {
-            G_ACTIVITY_GLOW_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
-        };
-        let ctx = Box::into_raw(Box::new(GlowUpdate { active, generation })) as *mut std::ffi::c_void;
-        let queue = &_dispatch_main_q as *const _ as *mut std::ffi::c_void;
-        if active {
-            dispatch_async_f(queue, ctx, apply_glow);
-        } else {
-            let when = dispatch_time(0, 350_000_000);
-            dispatch_after_f(when, queue, ctx, apply_glow);
+        let notification = send0(notification_class, selector(c"alloc"));
+        let notification = send0(notification, selector(c"init"));
+        let title_text = CString::new("Function needs your input").expect("static title");
+        let body_text = CString::new(question.replace('\0', " ")).unwrap_or_default();
+        let title = send1(string_class, selector(c"stringWithUTF8String:"), title_text.as_ptr() as *mut c_void);
+        let body = send1(string_class, selector(c"stringWithUTF8String:"), body_text.as_ptr() as *mut c_void);
+        if notification.is_null() || title.is_null() || body.is_null() {
+            tracing::warn!("Could not construct native attention notification");
+            return;
         }
+        let _ = send1(notification, selector(c"setTitle:"), title);
+        let _ = send1(notification, selector(c"setInformativeText:"), body);
+        let center = send0(center_class, selector(c"defaultUserNotificationCenter"));
+        if center.is_null() {
+            tracing::warn!("macOS notification center is unavailable");
+            return;
+        }
+        let _ = send1(center, selector(c"deliverNotification:"), notification);
+        let _ = send0(notification, selector(c"autorelease"));
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = active;
+    let _ = question;
 }
 
 /// Best-effort Force Touch trackpad feedback for meaningful agent state changes.
@@ -3795,5 +3702,25 @@ mod tests {
         assert!(!is_audio_playing());
         stop_audio_playback();
         assert!(!is_audio_playing());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_audio_playback_kills_a_tracked_child() {
+        stop_audio_playback();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        track_audio_process(child, None);
+        assert!(is_audio_playing());
+        stop_audio_playback();
+        for _ in 0..20 {
+            if !is_audio_playing() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("audio process remained active after stop");
     }
 }

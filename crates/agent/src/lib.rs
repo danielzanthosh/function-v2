@@ -25,6 +25,81 @@ pub const LIFECYCLE_LOG_TARGET: &str = "function_agent::lifecycle";
 const STATE_CHANNEL_CAPACITY: usize = 256;
 const MEMORY_RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(180);
+const SPEECH_SUMMARY_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClarificationOptions {
+    pub display_text: String,
+    pub question: String,
+    pub options: Vec<String>,
+}
+
+/// Complete a pending `request_user_choice` tool call with the user's answer.
+pub fn choice_result_message(tool_call_id: impl Into<String>, answer: &str) -> ChatMessage {
+    ChatMessage::tool(
+        tool_call_id,
+        serde_json::json!({"user_response": answer}).to_string(),
+    )
+}
+
+/// Recognize a final assistant response that explicitly presents numbered choices.
+pub fn parse_clarification_options(text: &str) -> Option<ClarificationOptions> {
+    let lines: Vec<&str> = text.lines().collect();
+    let heading = lines.iter().position(|line| {
+        line.trim_matches(|character| matches!(character, '*' | '#' | ' ' | '\t'))
+            .trim_end_matches(':')
+            .trim()
+            .eq_ignore_ascii_case("options")
+    })?;
+
+    let mut options = Vec::new();
+    let mut follow_up = Vec::new();
+    let mut reading_follow_up = false;
+    for line in &lines[heading + 1..] {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !reading_follow_up {
+            if let Some(option) = numbered_option(line) {
+                options.push(option.to_string());
+                continue;
+            }
+            if options.is_empty() {
+                return None;
+            }
+            reading_follow_up = true;
+        }
+        follow_up.push(line);
+    }
+    if !(2..=6).contains(&options.len()) || follow_up.is_empty() {
+        return None;
+    }
+
+    let question = follow_up.join(" ");
+    if !question.contains('?') {
+        return None;
+    }
+    let preceding = lines[..heading].join("\n").trim().to_string();
+    Some(ClarificationOptions {
+        display_text: preceding,
+        question,
+        options,
+    })
+}
+
+fn numbered_option(line: &str) -> Option<&str> {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let (number, remainder) = line.split_at(digits);
+    if number.parse::<usize>().ok()? == 0 {
+        return None;
+    }
+    let remainder = remainder.strip_prefix(['.', ')'])?.trim();
+    (!remainder.is_empty()).then_some(remainder)
+}
 
 #[derive(Error, Debug)]
 pub enum AgentError {
@@ -56,6 +131,21 @@ pub enum AgentState {
     Acting {
         action_description: String,
     },
+    Paused,
+    NeedsUserInput {
+        question: String,
+        options: Vec<String>,
+        tool_call_id: String,
+        selected_window_id: Option<u32>,
+        new_history: Vec<ChatMessage>,
+    },
+    ComputerUsePreview {
+        target_window_id: u32,
+        target_title: String,
+        frame: Vec<u8>,
+        cursor_x: Option<i32>,
+        cursor_y: Option<i32>,
+    },
     WaitingForConfirmation {
         action: String,
         details: String,
@@ -76,6 +166,11 @@ impl PartialEq for AgentState {
         match (self, other) {
             (AgentState::Idle, AgentState::Idle) => true,
             (AgentState::Listening, AgentState::Listening) => true,
+            (AgentState::Paused, AgentState::Paused) => true,
+            (
+                AgentState::NeedsUserInput { question: a, options: b, tool_call_id: c, selected_window_id: g, .. },
+                AgentState::NeedsUserInput { question: d, options: e, tool_call_id: f, selected_window_id: h, .. },
+            ) => a == d && b == e && c == f && g == h,
             (
                 AgentState::Processing { thought_summary: a },
                 AgentState::Processing { thought_summary: b },
@@ -92,6 +187,10 @@ impl PartialEq for AgentState {
                     action_description: b,
                 },
             ) => a == b,
+            (
+                AgentState::ComputerUsePreview { target_window_id: a, target_title: b, cursor_x: c, cursor_y: d, .. },
+                AgentState::ComputerUsePreview { target_window_id: e, target_title: f, cursor_x: g, cursor_y: h, .. },
+            ) => a == e && b == f && c == g && d == h,
             (
                 AgentState::WaitingForConfirmation {
                     action: a,
@@ -134,6 +233,7 @@ pub struct Agent {
     /// started with. Unlike a resettable flag, a new run can never "un-cancel"
     /// a previous run that is still in flight.
     cancel_tx: watch::Sender<u64>,
+    pause_tx: watch::Sender<bool>,
     current_run_cancel_base: AtomicU64,
     run_counter: AtomicU64,
     active_run: Arc<AtomicU64>,
@@ -149,6 +249,7 @@ struct RunHandle {
     run_id: u64,
     cancel_base: u64,
     cancel_rx: watch::Receiver<u64>,
+    pause_rx: watch::Receiver<bool>,
     state_tx: broadcast::Sender<AgentState>,
     active_run: Arc<AtomicU64>,
 }
@@ -186,6 +287,19 @@ impl RunHandle {
             }
             if rx.changed().await.is_err() {
                 std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    async fn wait_until_resumed(&self) -> bool {
+        let mut rx = self.pause_rx.clone();
+        loop {
+            if !*rx.borrow_and_update() {
+                return !self.is_canceled();
+            }
+            tokio::select! {
+                _ = self.canceled() => return false,
+                changed = rx.changed() => if changed.is_err() { return false; },
             }
         }
     }
@@ -232,6 +346,87 @@ impl Drop for RunGuard {
 struct RunFailure {
     error: AgentError,
     history: Vec<ChatMessage>,
+}
+
+struct RunOutput {
+    reply: String,
+    history: Vec<ChatMessage>,
+    pending_choice: Option<PendingChoice>,
+    selected_window_id: Option<u32>,
+}
+
+struct PendingChoice {
+    question: String,
+    options: Vec<String>,
+    tool_call_id: String,
+}
+
+fn parse_choice_request(arguments: &serde_json::Value) -> Result<(String, Vec<String>), AgentError> {
+    let question = arguments.get("question").and_then(serde_json::Value::as_str)
+        .map(str::trim).filter(|value| !value.is_empty())
+        .ok_or_else(|| AgentError::Tool("request_user_choice requires a non-empty question".into()))?;
+    let options = arguments.get("options").and_then(serde_json::Value::as_array)
+        .filter(|values| (2..=6).contains(&values.len()))
+        .ok_or_else(|| AgentError::Tool("request_user_choice requires 2 to 6 options".into()))?;
+    let options = options.iter().map(|value| {
+        value.as_str().map(str::trim).filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| AgentError::Tool("request_user_choice options must be non-empty strings".into()))
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok((question.to_string(), options))
+}
+
+fn enforce_background_input_scope(
+    call: &mut function_providers::ToolCall,
+    selected_window: &mut Option<u32>,
+) -> Result<(), AgentError> {
+    let action = call.arguments.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+    let parse_id = |key: &str| -> Result<Option<u32>, AgentError> {
+        let Some(value) = call.arguments.get(key) else { return Ok(None) };
+        let id = value.as_u64().and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| AgentError::Tool(format!("{key} must be a valid target window ID")))?;
+        Ok(Some(id))
+    };
+    let target_param = parse_id("target_window_id")?;
+    let screen_target = if call.name == "computer_screen"
+        && matches!(action, "target_screenshot" | "target_accessibility" | "target_accessibility_action")
+    {
+        parse_id("window_id")?
+    } else { None };
+    let explicit_target = target_param.or(screen_target);
+
+    if let Some(window_id) = explicit_target {
+        *selected_window = Some(window_id);
+        return Ok(());
+    }
+
+    if matches!(call.name.as_str(), "computer_mouse" | "computer_keyboard") {
+        if let Some(window_id) = *selected_window {
+            let Some(arguments) = call.arguments.as_object_mut() else {
+                return Err(AgentError::Tool("Background input arguments must be an object".into()));
+            };
+            arguments.insert("target_window_id".into(), serde_json::json!(window_id));
+        }
+        return Ok(());
+    }
+
+    if selected_window.is_some() && matches!(call.name.as_str(),
+        "open_app" | "close_app" | "click" | "double_click" | "type_text" | "press_key" | "scroll"
+    ) {
+        return Err(AgentError::Tool(format!(
+            "Global desktop action '{}' blocked while a background window is selected; use target-window computer tools instead",
+            call.name
+        )));
+    }
+
+    if selected_window.is_some() && call.name == "computer_apps"
+        && matches!(action, "launch" | "focus_window")
+    {
+        return Err(AgentError::Tool(
+            "Global app activation blocked while a background window is selected; select the next target with computer_screen target_windows and target_screenshot".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl RunFailure {
@@ -370,12 +565,14 @@ impl Agent {
     ) -> Self {
         let (state_tx, _) = broadcast::channel(STATE_CHANNEL_CAPACITY);
         let (cancel_tx, _) = watch::channel(0);
+        let (pause_tx, _) = watch::channel(false);
         Self {
             provider: RwLock::new(provider),
             tools,
             memory,
             state_tx,
             cancel_tx,
+            pause_tx,
             current_run_cancel_base: AtomicU64::new(0),
             run_counter: AtomicU64::new(0),
             active_run: Arc::new(AtomicU64::new(0)),
@@ -423,6 +620,26 @@ impl Agent {
         );
     }
 
+    /// Pause the current run at its next model/tool boundary.
+    pub fn pause(&self) {
+        self.pause_tx.send_replace(true);
+        if self.active_run.load(Ordering::SeqCst) != 0 {
+            let _ = self.state_tx.send(AgentState::Paused);
+        }
+    }
+
+    /// Resume a paused run.
+    pub fn resume(&self) {
+        self.pause_tx.send_replace(false);
+        let _ = self.state_tx.send(AgentState::Processing {
+            thought_summary: None,
+        });
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.pause_tx.borrow()
+    }
+
     /// Check if cancellation was requested for the most recent run.
     pub fn is_canceled(&self) -> bool {
         *self.cancel_tx.borrow() != self.current_run_cancel_base.load(Ordering::SeqCst)
@@ -454,6 +671,36 @@ impl Agent {
         self.state_tx.subscribe()
     }
 
+    /// Generate a short, spoken-only version of a completed response.
+    pub async fn generate_speech_text(&self, response: &str) -> Result<String, AgentError> {
+        let provider = self
+            .provider
+            .read()
+            .map_err(|error| AgentError::Provider(format!("Provider lock poisoned: {error}")))?
+            .clone();
+        let source: String = response.chars().take(8_000).collect();
+        let request = CompletionRequest {
+            model: "default".into(),
+            messages: vec![
+                ChatMessage::system(
+                    "Write a concise spoken version of the assistant response for text-to-speech. Output only the words to speak, in one short phrase or at most two sentences. Preserve the key answer and avoid markdown, headings, lists, and stage directions.",
+                ),
+                ChatMessage::user(source),
+            ],
+            tools: Vec::new(),
+            temperature: Some(0.3),
+        };
+        let response = tokio::time::timeout(SPEECH_SUMMARY_TIMEOUT, provider.complete(request))
+            .await
+            .map_err(|_| AgentError::Provider("Speech summary timed out".into()))?
+            .map_err(|error| AgentError::Provider(error.to_string()))?;
+        let text = limit_spoken_sentences(&response.message.content);
+        if text.is_empty() {
+            return Err(AgentError::Provider("Speech summary was empty".into()));
+        }
+        Ok(text)
+    }
+
     fn begin_run(&self) -> RunHandle {
         // A new run supersedes (and cancels) any run still in flight.
         let mut cancel_base = 0;
@@ -465,10 +712,12 @@ impl Agent {
             .store(cancel_base, Ordering::SeqCst);
         let run_id = self.run_counter.fetch_add(1, Ordering::SeqCst) + 1;
         self.active_run.fetch_max(run_id, Ordering::SeqCst);
+        self.pause_tx.send_replace(false);
         RunHandle {
             run_id,
             cancel_base,
             cancel_rx: self.cancel_tx.subscribe(),
+            pause_rx: self.pause_tx.subscribe(),
             state_tx: self.state_tx.clone(),
             active_run: self.active_run.clone(),
         }
@@ -487,11 +736,21 @@ impl Agent {
     /// and the updated history to store for the next turn.
     ///
     /// Every exit path broadcasts exactly one terminal state (`Completed`,
-    /// `Error`, or `Idle` on cancellation) unless a newer run superseded it.
+    /// `NeedsUserInput`, `Error`, or `Idle` on cancellation) unless superseded.
     pub async fn execute_with_history(
         &self,
         user_prompt: &str,
         prior_history: Vec<ChatMessage>,
+    ) -> Result<(String, Vec<ChatMessage>), AgentError> {
+        self.execute_with_history_in_window(user_prompt, prior_history, None).await
+    }
+
+    /// Execute a follow-up while preserving a previously selected background window.
+    pub async fn execute_with_history_in_window(
+        &self,
+        user_prompt: &str,
+        prior_history: Vec<ChatMessage>,
+        selected_window_id: Option<u32>,
     ) -> Result<(String, Vec<ChatMessage>), AgentError> {
         let run = self.begin_run();
         let started = Instant::now();
@@ -511,7 +770,7 @@ impl Agent {
             thought_summary: None,
         });
 
-        let outcome = self.run_loop(&run, user_prompt, prior_history).await;
+        let outcome = self.run_loop(&run, user_prompt, prior_history, selected_window_id).await;
         guard.armed = false;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -536,20 +795,31 @@ impl Agent {
         }
 
         match outcome {
-            Ok((reply, history)) => {
+            Ok(output) if output.pending_choice.is_some() => {
+                let pending = output.pending_choice.expect("guarded pending choice");
+                run.emit_final(AgentState::NeedsUserInput {
+                    question: pending.question,
+                    options: pending.options,
+                    tool_call_id: pending.tool_call_id,
+                    selected_window_id: output.selected_window_id,
+                    new_history: output.history.clone(),
+                });
+                Ok((output.reply, output.history))
+            }
+            Ok(output) => {
                 tracing::info!(
                     target: LIFECYCLE_LOG_TARGET,
                     run_id = run.run_id,
                     elapsed_ms,
-                    reply_chars = reply.chars().count(),
-                    history_messages = history.len(),
+                    reply_chars = output.reply.chars().count(),
+                    history_messages = output.history.len(),
                     "request completed"
                 );
                 run.emit_final(AgentState::Completed {
-                    summary: reply.clone(),
-                    new_history: history.clone(),
+                    summary: output.reply.clone(),
+                    new_history: output.history.clone(),
                 });
-                Ok((reply, history))
+                Ok((output.reply, output.history))
             }
             Err(RunFailure { error, history }) => {
                 tracing::error!(
@@ -573,7 +843,8 @@ impl Agent {
         run: &RunHandle,
         user_prompt: &str,
         prior_history: Vec<ChatMessage>,
-    ) -> Result<(String, Vec<ChatMessage>), RunFailure> {
+        selected_window_id: Option<u32>,
+    ) -> Result<RunOutput, RunFailure> {
         let run_id = run.run_id;
 
         // history_tail tracks just the conversation turns (no system msg, no tool internals)
@@ -640,7 +911,7 @@ Operating System Awareness:
 Primary High-Level Desktop Capabilities:
 1. `open_app`: Launch or focus applications natively by name (e.g. {\"name\": \"Google Chrome\"}, {\"name\": \"Terminal\"}). Uses native OS APIs on macOS, Windows, and Linux.
 2. `close_app`: Gracefully quit or terminate applications by name.
-3. `take_screenshot`: Capture the current screen state. Call this whenever you need visual context, after clicking or opening apps to verify the result, or when the user asks what is on screen.
+3. `computer_screen`: Use `target_windows` to find an app window, then keep its `window_id` for the workflow. Its window-scoped capture and input can operate while the window is behind another app; do not activate or raise it just to observe or control it. Refresh observations with `target_screenshot`, and prefer `target_accessibility` plus `target_accessibility_action` for labeled controls. Use target-scoped mouse/keyboard actions for canvas or custom UI and verify each action with a fresh target screenshot. Use full-desktop `screenshot` only when requested or when no target window is available. A window must remain capturable by macOS; respect Screen Recording and Accessibility permissions and report when unavailable.
 4. `click`: Click at specified (x, y) coordinates or current cursor location.
 5. `double_click`: Double click at specified (x, y) coordinates.
 6. `type_text`: Type text or unicode characters into the active input field or window.
@@ -652,11 +923,14 @@ Primary High-Level Desktop Capabilities:
 
 Agentic Multi-Step & Observation Loop:
 - Plan -> Execute -> Observe -> Recover/Iterate -> Conclude.
+- When a user decision is required, call `request_user_choice` with a concise question and 2–6 concise, mutually exclusive options. Do not continue the task before the user chooses. The UI also recognizes the older numbered `Options:` format as a fallback.
+- For background control, choose the target from `target_windows`; never use global mouse/keyboard tools or app focus commands after selection. Target-scoped input is delivered to that app without moving or typing through the user's physical mouse and keyboard.
+- The colored AI cursor is a preview-only overlay in Function's computer-use panel. It is not the macOS pointer, is not drawn into the target app, and does not move the user's real cursor.
 - For multi-step tasks (e.g., 'Open Chrome, go to YouTube, and check views'):
   1. Use `open_app` to launch the application.
-  2. Take a screenshot with `take_screenshot` to observe and verify the UI state.
+  2. List windows and capture the selected target with `computer_screen` before acting. Reuse its `window_id` for each scoped input action.
   3. Click, type, or press keys to navigate to the target.
-  4. Take a screenshot to inspect the new visual context and read the result.
+  4. Capture the target window again to inspect the new visual context and verify the result.
   5. Continue iteratively until the user's objective is fully accomplished.
 - If an action or tool fails, do NOT immediately abort or dump raw errors. Inspect the structured error, take a screenshot if visual insight helps, attempt an alternative recovery path, and continue.
 - Keep the final response clear, concise, and beautifully formatted in markdown.\n\nPersistent Memory:\n- When the user explicitly asks you to remember or save a useful fact or stable preference, call the `memory` tool with action `remember`. Do not claim it was saved unless the tool reports success.\n- Use the `memory` tool with action `recall` when the user asks what you remember or a saved fact is relevant.\n- Only delete memory when the user asks you to forget a specific item or clear a category.\n- Never save passwords, API keys, access tokens, recovery phrases, private keys, or other secrets."
@@ -680,6 +954,19 @@ Agentic Multi-Step & Observation Loop:
                 parameters: t.parameters_schema(),
             })
             .collect();
+        tool_definitions.push(ToolDefinition {
+            name: "request_user_choice".into(),
+            description: "Pause this task and ask the user to choose before continuing. Use only when a user decision is required; provide 2 to 6 concise options.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "question":{"type":"string"},
+                    "options":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"string"}}
+                },
+                "required":["question","options"],
+                "additionalProperties":false
+            }),
+        });
 
         // Build the full message list: system + prior history + new user turn
         let mut messages = Vec::with_capacity(prior_history.len() + 2);
@@ -702,9 +989,10 @@ Agentic Multi-Step & Observation Loop:
         let mut final_result = String::new();
         let mut consecutive_repeated_tool_calls = 0;
         let mut last_step_tool_signature = String::new();
+        let mut selected_window = selected_window_id;
 
         while step < self.max_steps {
-            if run.is_canceled() {
+            if !run.wait_until_resumed().await {
                 return Err(RunFailure::new(AgentError::Canceled, &history_tail));
             }
             step += 1;
@@ -1053,6 +1341,28 @@ Agentic Multi-Step & Observation Loop:
 
             let tool_calls = response_msg.tool_calls.clone().unwrap_or_default();
 
+            if let Some(choice_call) = tool_calls.iter().find(|call| call.name == "request_user_choice") {
+                if tool_calls.len() != 1 {
+                    return Err(RunFailure::new(AgentError::Tool(
+                        "request_user_choice must be the only tool call in its response".into(),
+                    ), &history_tail));
+                }
+                let (question, options) = parse_choice_request(&choice_call.arguments)
+                    .map_err(|error| RunFailure::new(error, &history_tail))?;
+                messages.push(response_msg);
+                let history = messages.into_iter().skip(1).collect();
+                return Ok(RunOutput {
+                    reply: question.clone(),
+                    history,
+                    pending_choice: Some(PendingChoice {
+                        question,
+                        options,
+                        tool_call_id: choice_call.id.clone(),
+                    }),
+                    selected_window_id: selected_window,
+                });
+            }
+
             // Create signature for current tool calls to detect repeated tool-call loops
             let current_sig = tool_calls
                 .iter()
@@ -1089,13 +1399,23 @@ Agentic Multi-Step & Observation Loop:
             messages.push(response_msg);
 
             for call in &tool_calls {
-                if run.is_canceled() {
+                if !run.wait_until_resumed().await {
                     return Err(RunFailure::new(AgentError::Canceled, &history_tail));
                 }
 
                 run.emit(AgentState::Acting {
                     action_description: describe_tool_call(call),
                 });
+
+                let mut scoped_call = call.clone();
+                if let Err(error) = enforce_background_input_scope(&mut scoped_call, &mut selected_window) {
+                    messages.push(ChatMessage::tool(
+                        call.id.clone(),
+                        serde_json::json!({"error":error.to_string()}).to_string(),
+                    ));
+                    tracing::warn!(target: LIFECYCLE_LOG_TARGET, run_id, tool = %call.name, error = %error, "blocked out-of-context desktop action");
+                    continue;
+                }
 
                 let tool_started = Instant::now();
                 tracing::info!(
@@ -1107,7 +1427,7 @@ Agentic Multi-Step & Observation Loop:
                     "tool call started"
                 );
 
-                let result = match self.run_tool(run, call).await {
+                let result = match self.run_tool(run, &scoped_call).await {
                     Some(result) => result,
                     None => {
                         tracing::info!(
@@ -1122,6 +1442,23 @@ Agentic Multi-Step & Observation Loop:
                     }
                 };
 
+                if let (Some(window_id), Some(title), Some(encoded)) = (
+                    result.output.get("window_id").and_then(|value| value.as_u64()).and_then(|value| u32::try_from(value).ok()),
+                    result.output.get("title").and_then(|value| value.as_str()),
+                    result.output.get("base64").and_then(|value| value.as_str()),
+                ) {
+                    use base64::Engine;
+                    if let Ok(frame) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                        run.emit(AgentState::ComputerUsePreview {
+                            target_window_id: window_id,
+                            target_title: title.to_string(),
+                            frame,
+                            cursor_x: result.output.get("cursor_x").and_then(|value| value.as_i64()).map(|value| value as i32),
+                            cursor_y: result.output.get("cursor_y").and_then(|value| value.as_i64()).map(|value| value as i32),
+                        });
+                    }
+                }
+
                 tracing::info!(
                     target: LIFECYCLE_LOG_TARGET,
                     run_id,
@@ -1134,12 +1471,7 @@ Agentic Multi-Step & Observation Loop:
                 );
 
                 // Extract screenshot base64 if visual observation was captured
-                let mut screenshot_base64 = None;
-                if call.name == "take_screenshot" || call.name == "computer_screen" {
-                    if let Some(b64) = result.output.get("base64").and_then(|v| v.as_str()) {
-                        screenshot_base64 = Some(b64.to_string());
-                    }
-                }
+                let screenshot_base64 = result.output.get("base64").and_then(|v| v.as_str()).map(str::to_string);
 
                 // Screenshot bytes are attached to the following image message. Never
                 // also serialize the same base64 payload into the tool-result text: it
@@ -1183,7 +1515,12 @@ Agentic Multi-Step & Observation Loop:
 
         // Append the assistant reply to the history tail for the caller to store
         history_tail.push(ChatMessage::assistant(final_result.clone()));
-        Ok((final_result, history_tail))
+        Ok(RunOutput {
+            reply: final_result,
+            history: history_tail,
+            pending_choice: None,
+            selected_window_id: selected_window,
+        })
     }
 
     /// Run a tool off the async worker threads so blocking tool code (shell
@@ -1266,11 +1603,190 @@ Agentic Multi-Step & Observation Loop:
     }
 }
 
+fn limit_spoken_sentences(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut sentence_count = 0;
+    for (index, character) in text.char_indices() {
+        if matches!(character, '.' | '!' | '?')
+            && text[index + character.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        {
+            sentence_count += 1;
+            if sentence_count == 2 {
+                return text[..index + character.len_utf8()].trim().to_string();
+            }
+        }
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use function_memory::InMemoryMemoryStore;
     use function_providers::MockLlmProvider;
+
+    #[test]
+    fn parses_numbered_clarification_choices_from_assistant_text() {
+        let result = parse_clarification_options(
+            "Research is still loading.\n\nOptions:\n\n1. Read the full answer first.\n\n2. Write a clearly labeled draft.\n\nWhich would you like? I will continue afterward.",
+        )
+        .expect("question with options should be interactive");
+
+        assert_eq!(
+            result.display_text,
+            "Research is still loading."
+        );
+        assert_eq!(result.question, "Which would you like? I will continue afterward.");
+        assert_eq!(
+            result.options,
+            ["Read the full answer first.", "Write a clearly labeled draft."]
+        );
+    }
+
+    #[test]
+    fn does_not_convert_an_unstructured_question_to_choices() {
+        assert!(parse_clarification_options("Which file should I use?").is_none());
+    }
+
+    struct ChoiceRequestProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ChoiceRequestProvider {
+        fn name(&self) -> &str { "choice-request-test" }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+
+        async fn complete(&self, request: CompletionRequest) -> Result<function_providers::CompletionResponse, function_providers::ProviderError> {
+            assert!(request.tools.iter().any(|tool| tool.name == "request_user_choice"));
+            Ok(function_providers::CompletionResponse {
+                message: ChatMessage {
+                    role: function_providers::MessageRole::Assistant,
+                    content: String::new(),
+                    images: None,
+                    tool_call_id: None,
+                    tool_calls: Some(vec![function_providers::ToolCall {
+                        id: "choice_1".into(),
+                        name: "request_user_choice".into(),
+                        arguments: serde_json::json!({"question":"Which source should I use?","options":["Official announcement","Wait for research"]}),
+                        thought_signature: None,
+                    }]),
+                    thought_signature: None,
+                },
+                finish_reason: Some("tool_calls".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn choice_tool_emits_typed_pending_input_and_stops_the_run() {
+        let agent = Agent::new(
+            Arc::new(ChoiceRequestProvider),
+            ToolRegistry::new(),
+            Arc::new(InMemoryMemoryStore::new()),
+        );
+        let mut states = agent.subscribe_state();
+
+        let (_, history) = agent.execute_with_history_in_window("Research this", vec![], Some(19)).await.unwrap();
+        assert!(matches!(history.last(), Some(ChatMessage { tool_calls: Some(_), .. })));
+
+        let mut choice = None;
+        let mut completed = false;
+        while let Ok(state) = states.try_recv() {
+            if let AgentState::NeedsUserInput { question, options, tool_call_id, selected_window_id, .. } = state {
+                choice = Some((question, options, tool_call_id, selected_window_id));
+            } else if matches!(state, AgentState::Completed { .. }) {
+                completed = true;
+            }
+        }
+        assert!(!completed, "a pending choice must stop before ordinary completion");
+        assert_eq!(choice, Some((
+            "Which source should I use?".into(),
+            vec!["Official announcement".into(), "Wait for research".into()],
+            "choice_1".into(),
+            Some(19),
+        )));
+    }
+
+    #[test]
+    fn choice_requests_reject_invalid_option_counts_and_empty_labels() {
+        assert!(parse_choice_request(&serde_json::json!({"question":"Pick?","options":["Only one"]})).is_err());
+        assert!(parse_choice_request(&serde_json::json!({"question":"Pick?","options":["A", " "]})).is_err());
+    }
+
+    #[test]
+    fn malformed_target_id_never_falls_back_to_global_input() {
+        let mut selected = None;
+        let mut call = function_providers::ToolCall {
+            id: "bad-target".into(), name: "computer_mouse".into(),
+            arguments: serde_json::json!({"action":"click","target_window_id":-1,"x":1,"y":1}),
+            thought_signature: None,
+        };
+        assert!(enforce_background_input_scope(&mut call, &mut selected).is_err());
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn selecting_an_option_returns_the_pending_tool_call_result() {
+        let response = choice_result_message("choice_1", "Official announcement");
+        assert_eq!(response.role, function_providers::MessageRole::Tool);
+        assert_eq!(response.tool_call_id.as_deref(), Some("choice_1"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&response.content).unwrap(),
+            serde_json::json!({"user_response":"Official announcement"}));
+    }
+
+    #[test]
+    fn selected_background_window_scopes_low_level_input_and_blocks_global_input() {
+        let mut selected = None;
+        let mut observe = function_providers::ToolCall {
+            id: "1".into(), name: "computer_screen".into(),
+            arguments: serde_json::json!({"action":"target_screenshot","window_id":42}), thought_signature: None,
+        };
+        enforce_background_input_scope(&mut observe, &mut selected).unwrap();
+        assert_eq!(selected, Some(42));
+
+        let mut type_text = function_providers::ToolCall {
+            id: "2".into(), name: "computer_keyboard".into(),
+            arguments: serde_json::json!({"action":"type","text":"private test"}), thought_signature: None,
+        };
+        enforce_background_input_scope(&mut type_text, &mut selected).unwrap();
+        assert_eq!(type_text.arguments["target_window_id"], 42);
+
+        let mut mouse = function_providers::ToolCall {
+            id: "mouse".into(), name: "computer_mouse".into(),
+            arguments: serde_json::json!({"action":"click","x":12,"y":18}), thought_signature: None,
+        };
+        enforce_background_input_scope(&mut mouse, &mut selected).unwrap();
+        assert_eq!(mouse.arguments["target_window_id"], 42);
+
+        let mut global_click = function_providers::ToolCall {
+            id: "3".into(), name: "click".into(),
+            arguments: serde_json::json!({"x":10,"y":20}), thought_signature: None,
+        };
+        assert!(enforce_background_input_scope(&mut global_click, &mut selected).is_err());
+
+        let mut focus_window = function_providers::ToolCall {
+            id: "focus".into(), name: "computer_apps".into(),
+            arguments: serde_json::json!({"action":"focus_window","window_title":"TextEdit"}), thought_signature: None,
+        };
+        assert!(enforce_background_input_scope(&mut focus_window, &mut selected).is_err());
+
+        let mut switch = function_providers::ToolCall {
+            id: "4".into(), name: "computer_mouse".into(),
+            arguments: serde_json::json!({"action":"click","target_window_id":77,"x":5,"y":6}), thought_signature: None,
+        };
+        enforce_background_input_scope(&mut switch, &mut selected).unwrap();
+        assert_eq!(selected, Some(77));
+    }
+
+    #[test]
+    fn speech_text_is_limited_to_two_sentences() {
+        assert_eq!(
+            limit_spoken_sentences("First answer. Second answer! Third answer."),
+            "First answer. Second answer!"
+        );
+    }
 
     #[tokio::test]
     async fn test_agent_execution() {

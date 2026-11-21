@@ -22,5 +22,7 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Function needs microphone access for voice input.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Function captures the selected application window so its assistant can observe and control the task.</string>
 </dict>
 </plist>

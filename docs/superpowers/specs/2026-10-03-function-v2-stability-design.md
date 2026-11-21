@@ -1,4 +1,4 @@
-# Function Version 1 Stability and macOS Interaction Design
+# Function Version 2 Stability and macOS Interaction Design
 
 ## Goal
 

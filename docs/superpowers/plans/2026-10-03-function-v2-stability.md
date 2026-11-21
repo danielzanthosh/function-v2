@@ -1,4 +1,4 @@
-# Function Version 1 Stability Implementation Plan
+# Function Version 2 Stability Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, Cargo workspace, GPUI 0.2.2, AppKit Objective-C runtime calls on macOS, platform-gated `std::process::Command`, Cargo unit tests.
 
-**Spec:** `docs/superpowers/specs/2026-10-03-function-v1-stability-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-03-function-v2-stability-design.md`
 
 ## Global Constraints
 
